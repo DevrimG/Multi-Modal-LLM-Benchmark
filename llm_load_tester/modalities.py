@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Modality handlers for different input types: Text, Image, and Voice.
 """
@@ -35,6 +37,18 @@ class ModalityHandler(ABC):
         """Get preset configurations for this modality."""
         pass
 
+    def resolve_temperature(self, config: dict[str, Any], default: float) -> float:
+        """Resolve provider-specific temperature requirements."""
+        endpoint = str(config.get("endpoint", ""))
+        if "moonshot.ai" in endpoint or "moonshot.cn" in endpoint:
+            return 1.0
+        return default
+
+    def is_moonshot_endpoint(self, config: dict[str, Any]) -> bool:
+        """Check whether the request targets Moonshot."""
+        endpoint = str(config.get("endpoint", ""))
+        return "moonshot.ai" in endpoint or "moonshot.cn" in endpoint
+
 
 class DirectoryInputHandler(ModalityHandler):
     """Shared directory-based file selection for multimodal inputs."""
@@ -42,10 +56,16 @@ class DirectoryInputHandler(ModalityHandler):
     SUPPORTED_FORMATS: set[str] = set()
 
     def __init__(self) -> None:
-        self._selection_lock = asyncio.Lock()
+        self._selection_lock: asyncio.Lock | None = None
         self._current_directory: Path | None = None
         self._files: list[Path] = []
         self._next_index = 0
+
+    def _ensure_selection_lock(self) -> asyncio.Lock:
+        """Create the selection lock inside a running event loop."""
+        if self._selection_lock is None:
+            self._selection_lock = asyncio.Lock()
+        return self._selection_lock
 
     def _resolve_path(self, path_str: str) -> Path:
         """Resolve a path string, handling shell escapes, env vars, and home dir."""
@@ -64,7 +84,7 @@ class DirectoryInputHandler(ModalityHandler):
 
     async def _get_next_file(self, directory: Path, source_label: str) -> Path:
         """Return the next file from a shuffled directory pool."""
-        async with self._selection_lock:
+        async with self._ensure_selection_lock():
             if self._current_directory != directory:
                 self._files = self._list_supported_files(directory)
                 if not self._files:
@@ -333,11 +353,9 @@ class TextHandler(ModalityHandler):
         input_tokens = config.get("input_tokens", 512)
         output_tokens = config.get("output_tokens", 512)
         model = config.get("model", "default-model")
-        
-        # Generate a truly random, diverse prompt
-        prompt = self.generate_random_prompt(input_tokens)
-        
-        # Vary the system prompt too for more diversity
+
+        # Vary the system prompt for most providers, but keep Moonshot text tests
+        # deterministic so benchmark runs are comparable and easier to debug.
         system_prompts = [
             "You are a helpful assistant.",
             "You are an expert software engineer with deep knowledge of system design.",
@@ -348,16 +366,30 @@ class TextHandler(ModalityHandler):
             "You are a research analyst who provides evidence-based insights.",
             "You are a technical writer specializing in documentation.",
         ]
+
+        if self.is_moonshot_endpoint(config):
+            prompt = (
+                "Write a concise technical explanation of how a token bucket rate limiter "
+                "works in an API server. Include a simple example and key trade-offs."
+            )
+            prompt = self._generate_detailed_content(prompt, input_tokens * self.CHARS_PER_TOKEN)
+            system_prompt = "You are a precise technical assistant."
+        else:
+            prompt = self.generate_random_prompt(input_tokens)
+            system_prompt = random.choice(system_prompts)
         
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": random.choice(system_prompts)},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": output_tokens,
             "stream": True,
-            "temperature": random.uniform(0.5, 0.9)  # Vary temperature slightly
+            "temperature": self.resolve_temperature(
+                config,
+                random.uniform(0.5, 0.9),
+            ),
         }
         
         metadata = {
@@ -432,7 +464,7 @@ class ImageHandler(DirectoryInputHandler):
             ],
             "max_tokens": max_tokens,
             "stream": True,
-            "temperature": 0.7
+            "temperature": self.resolve_temperature(config, 0.7)
         }
         
         metadata = {
@@ -524,7 +556,7 @@ class VoiceHandler(DirectoryInputHandler):
             ],
             "max_tokens": max_tokens,
             "stream": True,
-            "temperature": 0.7
+            "temperature": self.resolve_temperature(config, 0.7)
         }
         
         metadata = {

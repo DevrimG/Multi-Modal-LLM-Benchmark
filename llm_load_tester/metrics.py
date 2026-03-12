@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Metrics collection, calculation, and export for LLM load testing.
 """

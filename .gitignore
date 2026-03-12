@@ -12,12 +12,9 @@ env/
 .pytest_cache/
 .mypy_cache/
 
-benchmarks/*
-!benchmarks/.gitkeep
-images/*
-!images/.gitkeep
-sound/*
-!sound/.gitkeep
+benchmarks/
+images/
+sound/
 
 llm_benchmark_*.json
 llm_benchmark_*.csv

@@ -168,7 +168,7 @@ Select Export Format:
   2. CSV (raw request metrics only)
 
 Enter choice [1]: 1
-Enter filename for export [benchmarks/llm_benchmark_20240218_120530.json]: 
+Enter filename for export [/path/to/Multi-Modal-LLM-Benchmark/benchmarks/llm_benchmark_20240218_120530.json]: 
 ✓ Results exported to: /path/to/Multi-Modal-LLM-Benchmark/benchmarks/llm_benchmark_20240218_120530.json
 
 ┌───────────────────────────────────────────────────────────┐

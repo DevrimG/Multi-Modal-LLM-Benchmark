@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Interactive CLI interface for the benchmark tool."""
 
 import asyncio
@@ -13,6 +15,9 @@ from .modalities import get_handler
 
 
 console = Console()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_BENCHMARKS_DIR = PROJECT_ROOT / "benchmarks"
+DISPLAY_BENCHMARKS_DIR = Path("/") / PROJECT_ROOT.name / "benchmarks"
 
 
 # Preset configurations
@@ -29,7 +34,22 @@ API_PRESETS = {
         "endpoint": "http://localhost:11434",
         "api_route": "v1/chat/completions"
     },
+    "Moonshot AI": {
+        "endpoint": "https://api.moonshot.ai",
+        "api_route": "v1/chat/completions"
+    },
     "Custom": None
+}
+
+PROVIDER_MODEL_HINTS = {
+    "Moonshot AI": {
+        "examples": [
+            "moonshot-v1-8k",
+            "moonshot-v1-32k",
+            "moonshot-v1-128k",
+        ],
+        "default": "moonshot-v1-8k",
+    }
 }
 
 TOKEN_PRESETS = [256, 512, 1024, 2048, 4096, 8192]
@@ -135,13 +155,57 @@ def select_from_presets(
     return selected
 
 
-async def test_endpoint(endpoint: str, api_route: str) -> tuple[bool, list[str] | None, str]:
+def build_auth_headers(api_key: str | None) -> dict[str, str]:
+    """Build HTTP headers for optional bearer authentication."""
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def mask_api_key(api_key: str | None) -> str:
+    """Mask an API key while leaving the last 4 characters visible."""
+    if not api_key:
+        return "(none)"
+    if len(api_key) <= 4:
+        return "*" * len(api_key)
+    return f"{'*' * (len(api_key) - 4)}{api_key[-4:]}"
+
+
+async def validate_api_key(endpoint: str, api_key: str) -> tuple[bool, str]:
+    """Validate bearer authentication against the models endpoint."""
+    headers = build_auth_headers(api_key)
+    models_url = f"{endpoint}/v1/models"
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(models_url, headers=headers) as response:
+                if response.status == 200:
+                    return True, "API key accepted"
+                if response.status in (401, 403):
+                    text = await response.text()
+                    if "invalid authentication" in text.lower():
+                        return False, "API key rejected: invalid authentication"
+                    return False, f"API key rejected with status {response.status}"
+                text = await response.text()
+                return False, f"API key test returned status {response.status}: {text[:100]}"
+    except Exception as e:
+        return False, f"API key test failed: {str(e)[:100]}"
+
+
+async def test_endpoint(
+    endpoint: str,
+    api_route: str,
+    api_key: str | None = None
+) -> tuple[bool, list[str] | None, str]:
     """Test connection to endpoint and fetch available models.
     
     Returns: (success, available_models, message)
     """
     url = f"{endpoint}/{api_route}"
     models_url = f"{endpoint}/v1/models"
+    headers = build_auth_headers(api_key)
     
     try:
         timeout = aiohttp.ClientTimeout(total=10)
@@ -149,7 +213,7 @@ async def test_endpoint(endpoint: str, api_route: str) -> tuple[bool, list[str] 
             # Try to fetch models first - this validates the endpoint exists
             models = None
             try:
-                async with session.get(models_url) as response:
+                async with session.get(models_url, headers=headers) as response:
                     if response.status == 200:
                         data = await response.json()
                         if "data" in data and isinstance(data["data"], list):
@@ -173,7 +237,7 @@ async def test_endpoint(endpoint: str, api_route: str) -> tuple[bool, list[str] 
                 }
                 
                 try:
-                    async with session.post(url, json=test_payload) as response:
+                    async with session.post(url, json=test_payload, headers=headers) as response:
                         if response.status == 200:
                             return True, models, "Endpoint is reachable"
                         elif response.status in (401, 403):
@@ -203,16 +267,40 @@ async def test_endpoint(endpoint: str, api_route: str) -> tuple[bool, list[str] 
         return False, None, f"Connection failed: {str(e)[:100]}"
 
 
-def select_api_config() -> tuple[str, str, list[str] | None]:
+def select_auth_mode() -> str | None:
+    """Prompt for optional bearer authentication."""
+    console.print("\n[bold]Authentication:[/bold]")
+    console.print("  1. Continue with no bearer key")
+    console.print("  2. Enter API key")
+    console.print()
+
+    valid_choices = {"1", "2"}
+    while True:
+        choice = Prompt.ask("Enter choice (1)", default="1")
+        if choice in valid_choices:
+            break
+        console.print("[red]Invalid choice. Please enter 1 or 2.[/red]")
+
+    if choice == "1":
+        return None
+
+    api_key = Prompt.ask("Enter API key", password=True).strip() or None
+    if api_key:
+        console.print(f"[green]Using bearer key ending in {mask_api_key(api_key)[-4:]}[/green]")
+    return api_key
+
+
+def select_api_config() -> tuple[str, str, list[str] | None, str | None, str | None]:
     """Prompt user for API endpoint and route configuration.
     
-    Returns: (endpoint, api_route, available_models)
+    Returns: (endpoint, api_route, available_models, api_key, provider_name)
     """
     result = select_from_presets(
         "Select API Configuration Preset:",
         API_PRESETS,
         allow_custom=True
     )
+    provider_name = None
     
     if result is None or isinstance(result, str):  # Custom selected
         console.print("\n[dim]Enter custom API configuration:[/dim]")
@@ -229,12 +317,24 @@ def select_api_config() -> tuple[str, str, list[str] | None]:
             endpoint = f"http://{endpoint}"
     else:
         name, config = result
+        provider_name = name
         endpoint = config["endpoint"]
         api_route = config["api_route"]
+
+    api_key = select_auth_mode()
+
+    if api_key:
+        console.print(f"\n[yellow]Testing API key {mask_api_key(api_key)}...[/yellow]")
+        auth_ok, auth_message = asyncio.run(validate_api_key(endpoint, api_key))
+        if auth_ok:
+            console.print(f"[green]✓ {auth_message}[/green]")
+        else:
+            console.print(f"[red]✗ {auth_message}[/red]")
+            console.print("[yellow]Warning: Continuing with the provided key anyway...[/yellow]")
     
     # Test the endpoint
     console.print(f"\n[yellow]Testing connection to {endpoint}...[/yellow]")
-    success, models, message = asyncio.run(test_endpoint(endpoint, api_route))
+    success, models, message = asyncio.run(test_endpoint(endpoint, api_route, api_key))
     
     if success:
         console.print(f"[green]✓ {message}[/green]")
@@ -244,12 +344,16 @@ def select_api_config() -> tuple[str, str, list[str] | None]:
         console.print(f"[red]✗ {message}[/red]")
         console.print("[yellow]Warning: Endpoint test failed. Continuing anyway...[/yellow]")
     
-    return endpoint, api_route, models
+    return endpoint, api_route, models, api_key, provider_name
 
 
-def select_model(available_models: list[str] | None = None) -> str:
+def select_model(
+    available_models: list[str] | None = None,
+    provider_name: str | None = None
+) -> str:
     """Prompt user to enter model name."""
     console.print("\n[bold]Enter Model Name:[/bold]")
+    provider_hints = PROVIDER_MODEL_HINTS.get(provider_name or "")
     
     if available_models:
         console.print("\n[dim]Available models on this endpoint:[/dim]")
@@ -274,9 +378,15 @@ def select_model(available_models: list[str] | None = None) -> str:
                 # User entered a custom model name
                 return choice
     else:
-        console.print("[dim]Examples: gpt-4, meta-llama/Llama-2-7b-chat-hf, mistral-7b-instruct[/dim]")
+        if provider_hints:
+            examples = ", ".join(provider_hints["examples"])
+            console.print(f"[dim]Examples: {examples}[/dim]")
+            default_model = provider_hints["default"]
+        else:
+            console.print("[dim]Examples: gpt-oss, meta-llama/Llama-2-7b-chat-hf, mistral-7b-instruct[/dim]")
+            default_model = "gpt-oss"
         console.print()
-        return Prompt.ask("Model name", default="gpt-4")
+        return Prompt.ask("Model name", default=default_model)
 
 
 def select_token_length(prompt_text: str) -> int:
@@ -481,17 +591,26 @@ def get_export_filename(format_type: str) -> str:
     from datetime import datetime
     
     default_name = f"llm_benchmark_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{format_type}"
-    default_path = Path("benchmarks") / default_name
+    default_display_path = DISPLAY_BENCHMARKS_DIR / default_name
     
     filename = Prompt.ask(
         "Enter filename for export",
-        default=str(default_path)
+        default=str(default_display_path)
     )
 
-    filepath = Path(filename).expanduser()
+    if filename.startswith(f"{DISPLAY_BENCHMARKS_DIR}/"):
+        relative_name = Path(filename).relative_to(DISPLAY_BENCHMARKS_DIR)
+        filepath = DEFAULT_BENCHMARKS_DIR / relative_name
+    elif filename == str(DISPLAY_BENCHMARKS_DIR):
+        filepath = DEFAULT_BENCHMARKS_DIR / default_name
+    else:
+        filepath = Path(filename).expanduser()
 
-    if not filepath.is_absolute() and filepath.parent == Path("."):
-        filepath = Path("benchmarks") / filepath.name
+    if not filepath.is_absolute():
+        if filepath.parent == Path("."):
+            filepath = DEFAULT_BENCHMARKS_DIR / filepath.name
+        else:
+            filepath = (PROJECT_ROOT / filepath).resolve()
 
     if filepath.suffix.lower() != f".{format_type}":
         filepath = filepath.with_suffix(f".{format_type}")
@@ -510,12 +629,13 @@ def run_interactive_config() -> dict[str, Any]:
     config["modality"] = modality
     
     # 2. API Configuration (with connection test)
-    endpoint, api_route, available_models = select_api_config()
+    endpoint, api_route, available_models, api_key, provider_name = select_api_config()
     config["endpoint"] = endpoint
     config["api_route"] = api_route
+    config["api_key"] = api_key
     
     # 3. Model selection (with available models if fetched)
-    model = select_model(available_models)
+    model = select_model(available_models, provider_name)
     config["model"] = model
     
     # 4. Modality-specific configuration

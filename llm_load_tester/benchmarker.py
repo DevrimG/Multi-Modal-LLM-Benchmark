@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Core benchmark engine for asynchronous LLM load testing.
 """
@@ -24,6 +26,7 @@ class LoadTestConfig:
     """Configuration for a load test run."""
     endpoint: str
     api_route: str
+    api_key: str | None
     model: str
     concurrency: int
     target_rps: float
@@ -42,14 +45,20 @@ class AsyncRateLimiter:
         self.unlimited = self.target_rps == 0
         self.tokens = self.target_rps
         self.last_update = time.monotonic()
-        self.lock = asyncio.Lock()
+        self.lock: asyncio.Lock | None = None
+
+    def _ensure_lock(self) -> asyncio.Lock:
+        """Create the rate limiter lock inside a running event loop."""
+        if self.lock is None:
+            self.lock = asyncio.Lock()
+        return self.lock
     
     async def acquire(self) -> None:
         """Acquire a token, waiting if necessary to maintain target RPS."""
         if self.unlimited:
             return
 
-        async with self.lock:
+        async with self._ensure_lock():
             now = time.monotonic()
             elapsed = now - self.last_update
             self.tokens = min(self.target_rps, self.tokens + elapsed * self.target_rps)
@@ -90,20 +99,40 @@ class LLMBenchmarker:
         )
         self.rate_limiter = AsyncRateLimiter(config.target_rps)
         self.request_counter = 0
-        self.counter_lock = asyncio.Lock()
-        self.semaphore = asyncio.Semaphore(config.concurrency)
+        self.counter_lock: asyncio.Lock | None = None
+        self.semaphore: asyncio.Semaphore | None = None
+
+    def _ensure_async_primitives(self) -> None:
+        """Create asyncio synchronization primitives inside a running event loop."""
+        if self.counter_lock is None:
+            self.counter_lock = asyncio.Lock()
+        if self.semaphore is None:
+            self.semaphore = asyncio.Semaphore(self.config.concurrency)
         
     async def _get_next_request_id(self) -> int:
         """Get the next request ID atomically."""
+        self._ensure_async_primitives()
         async with self.counter_lock:
+            self.request_counter += 1
+            return self.request_counter
+
+    async def _claim_request_id(self) -> int | None:
+        """Reserve the next benchmark request ID or return None when complete."""
+        self._ensure_async_primitives()
+        async with self.counter_lock:
+            if self.request_counter >= self.config.total_requests:
+                return None
             self.request_counter += 1
             return self.request_counter
     
     def _parse_sse_line(self, line: str) -> dict[str, Any] | None:
         """Parse a Server-Sent Events line."""
-        if line.startswith("data: "):
-            data = line[6:]  # Remove "data: " prefix
-            if data == "[DONE]":
+        if line.startswith(":"):
+            return None
+
+        if line.startswith("data:"):
+            data = line[5:].lstrip()
+            if not data or data == "[DONE]":
                 return None
             try:
                 return json.loads(data)
@@ -140,15 +169,21 @@ class LLMBenchmarker:
     async def _make_request(
         self,
         session: aiohttp.ClientSession,
+        request_id: int | None = None,
         is_warmup: bool = False
     ) -> RequestMetrics:
         """Execute a single request and collect metrics."""
-        request_id = await self._get_next_request_id()
+        if request_id is None:
+            request_id = await self._get_next_request_id()
         url = f"{self.config.endpoint}/{self.config.api_route}"
         
         # Generate a fresh unique payload for this request
         payload_result = await self.config.modality_handler.prepare_payload(
-            self.config.modality_config
+            {
+                **self.config.modality_config,
+                "endpoint": self.config.endpoint,
+                "api_route": self.config.api_route,
+            }
         )
         
         metrics = RequestMetrics(
@@ -159,10 +194,13 @@ class LLMBenchmarker:
         
         try:
             timeout = aiohttp.ClientTimeout(total=self.config.timeout_seconds)
+            headers = {"Content-Type": "application/json"}
+            if self.config.api_key:
+                headers["Authorization"] = f"Bearer {self.config.api_key}"
             async with session.post(
                 url,
                 json=payload_result.payload,
-                headers={"Content-Type": "application/json"},
+                headers=headers,
                 timeout=timeout
             ) as response:
                 metrics.status_code = response.status
@@ -188,22 +226,23 @@ class LLMBenchmarker:
                     chunk = self._parse_sse_line(line)
                     if chunk is None:
                         continue
-                    
-                    # Record TTFT on first chunk with content
-                    if not first_token_received:
-                        metrics.first_token_time = time.monotonic()
-                        first_token_received = True
-                    
-                    # Count tokens from this chunk
+
+                    # Count tokens and collect only actual textual deltas.
                     tokens_generated += self._count_tokens_from_chunk(chunk)
-                    
-                    # Collect response content
                     content = self._extract_content_from_chunk(chunk)
                     if content:
+                        if not first_token_received:
+                            metrics.first_token_time = time.monotonic()
+                            first_token_received = True
                         response_content_parts.append(content)
                 
                 metrics.tokens_generated = tokens_generated
                 metrics.response_content = "".join(response_content_parts)
+                if metrics.response_content == "":
+                    metrics.error = ErrorCategory.UNKNOWN
+                    metrics.error_message = (
+                        "HTTP 200 response completed without any textual content chunks."
+                    )
                 metrics.end_time = time.monotonic()
                 
         except asyncio.TimeoutError:
@@ -257,17 +296,16 @@ class LLMBenchmarker:
     ) -> None:
         """Worker coroutine that runs requests with rate limiting."""
         while True:
+            request_id = await self._claim_request_id()
+            if request_id is None:
+                break
+
             # Rate limiting
             await self.rate_limiter.acquire()
-            
-            # Check if we've completed enough requests
-            async with self.counter_lock:
-                if self.request_counter >= self.config.total_requests:
-                    break
-            
+
             # Execute request with concurrency control (each gets unique payload)
             async with self.semaphore:
-                metrics = await self._make_request(session)
+                metrics = await self._make_request(session, request_id=request_id)
                 self.result.add_request(metrics)
                 progress.update(progress_task, advance=1)
     

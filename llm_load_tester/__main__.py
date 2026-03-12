@@ -31,6 +31,7 @@ def main() -> int:
         load_config = LoadTestConfig(
             endpoint=config_dict["endpoint"],
             api_route=config_dict["api_route"],
+            api_key=config_dict.get("api_key"),
             model=config_dict["model"],
             concurrency=config_dict["concurrency"],
             target_rps=config_dict["target_rps"],
