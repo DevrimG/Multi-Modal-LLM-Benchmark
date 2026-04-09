@@ -34,7 +34,7 @@ class LoadTestConfig:
     warmup_requests: int
     modality_handler: ModalityHandler
     modality_config: dict[str, Any]
-    timeout_seconds: float = 120.0
+    timeout_seconds: float = 300.0
 
 
 class AsyncRateLimiter:
