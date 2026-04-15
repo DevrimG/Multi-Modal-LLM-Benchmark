@@ -59,6 +59,7 @@ CONCURRENCY_PRESETS = [1, 2, 4, 8, 16, 32, 64]
 RPS_PRESETS = [0.5, 1.0, 2.0, 5.0, 10.0, 20.0]
 
 REQUEST_COUNT_PRESETS = [10, 50, 100, 200, 500, 1000]
+API_ROUTE_PRESETS = ["v1/chat/completions", "v2/chat/completions", "custom"]
 
 
 def print_header() -> None:
@@ -290,6 +291,32 @@ def select_auth_mode() -> str | None:
     return api_key
 
 
+def select_api_route(default_route: str = "v1/chat/completions") -> str:
+    """Prompt user to select an API route."""
+    console.print("\n[bold]Select API Route:[/bold]")
+    for i, route in enumerate(API_ROUTE_PRESETS, 1):
+        if route == "custom":
+            console.print(f"  {i}. Custom")
+        else:
+            console.print(f"  {i}. {route}")
+    console.print()
+
+    route_to_index = {route: str(i + 1) for i, route in enumerate(API_ROUTE_PRESETS)}
+    default_choice = route_to_index.get(default_route, "1")
+    valid_choices = set(route_to_index.values())
+
+    while True:
+        choice = Prompt.ask(f"Enter choice ({default_choice})", default=default_choice)
+        if choice in valid_choices:
+            break
+        console.print(f"[red]Invalid choice. Please enter 1-{len(API_ROUTE_PRESETS)}.[/red]")
+
+    selected = API_ROUTE_PRESETS[int(choice) - 1]
+    if selected == "custom":
+        return Prompt.ask("Enter custom API Route", default=default_route)
+    return selected
+
+
 def select_api_config() -> tuple[str, str, list[str] | None, str | None, str | None]:
     """Prompt user for API endpoint and route configuration.
     
@@ -308,10 +335,7 @@ def select_api_config() -> tuple[str, str, list[str] | None, str | None, str | N
             "Endpoint IP:Port",
             default="localhost:8000"
         )
-        api_route = Prompt.ask(
-            "API Route",
-            default="v1/chat/completions"
-        )
+        api_route = select_api_route("v1/chat/completions")
         # Ensure endpoint has http:// prefix
         if not endpoint.startswith(("http://", "https://")):
             endpoint = f"http://{endpoint}"
@@ -319,7 +343,7 @@ def select_api_config() -> tuple[str, str, list[str] | None, str | None, str | N
         name, config = result
         provider_name = name
         endpoint = config["endpoint"]
-        api_route = config["api_route"]
+        api_route = select_api_route(config["api_route"])
 
     api_key = select_auth_mode()
 
@@ -662,6 +686,10 @@ def run_interactive_config() -> dict[str, Any]:
     config["concurrency"] = select_concurrency()
     config["target_rps"] = select_rps()
     config["total_requests"] = select_request_count()
-    config["warmup_requests"] = 5  # Fixed as per requirements
-    
+    should_warmup = Confirm.ask(
+        "Send warm-up requests before benchmark? (5 requests)",
+        default=True
+    )
+    config["warmup_requests"] = 5 if should_warmup else 0
+
     return config
